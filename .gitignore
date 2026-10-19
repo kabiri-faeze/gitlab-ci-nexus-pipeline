@@ -1,0 +1,11 @@
+# Build output
+.venv/
+build/
+dist/
+*.spec
+build_hello.py
+__pycache__/
+*.pyc
+
+# Training video project (Remotion), kept local only
+training-video/

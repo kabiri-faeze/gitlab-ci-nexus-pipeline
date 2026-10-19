@@ -1,0 +1,13 @@
+# Builds the Windows hello.exe on Linux: PyInstaller for Windows running under Wine (image has Windows Python in it).
+# Usage: docker build --build-arg VERSION=abc123 -f Dockerfile.build-exe .   (context: app/)
+FROM docker.io/tobix/pywine:3.12
+ARG VERSION=local
+WORKDIR /build
+COPY requirements.txt hello.py ./
+RUN wine python -m pip install --quiet -r requirements.txt \
+ && sed "s/__VERSION__/${VERSION}/" hello.py > build_hello.py \
+ && wine python -m PyInstaller --noconfirm --onefile --name hello --distpath /out build_hello.py \
+ && test -s /out/hello.exe
+# Smoke test only: this image's Wine cannot load python312.dll from a onefile exe ("DLL initialization failed"),
+# so a failure here is a warning. Test the exe on real Windows.
+RUN wine /out/hello.exe || echo "WARNING: hello.exe did not run under Wine; test it on Windows"

@@ -1,0 +1,121 @@
+# Client side: builds hello.exe (Windows, via Wine) and the Ubuntu binaries, uploads them and the *.sh files
+# to Nexus (raw repository releases-raw), and creates a release. Container images stay in Harbor (hello-pipeline).
+#
+# Needs CI/CD variables NEXUS_USER (= ci) and NEXUS_PASSWORD (masked); see nexus/setup.sh and README.md.
+# Merge request -> build only.  main branch -> build, upload to Nexus, release.
+
+stages: [nexus, build, publish, release]
+
+variables:
+  DOCKER_HOST: unix:///var/run/docker.sock   # the server's Podman API (mounted by the runner)
+  DOCKER_BUILDKIT: "0"                       # Podman 3.x has no BuildKit; use the classic builder
+  NEXUS_URL: http://server.example.com:8081
+  NEXUS_REPO: releases-raw
+  RELEASE_VERSION: "v1.$CI_PIPELINE_IID"   # same number as the GitLab release and its tag
+  # Files go to $NEXUS_URL/repository/$NEXUS_REPO/hello/<RELEASE_VERSION>/<file> and hello/latest/<file>.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Creates or replaces the Nexus container on the server (data is kept in the volume nexus-data).
+# Manual on main (press play). After the first run, do nexus/setup.sh once (see README.md).
+nexus:
+  stage: nexus
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [nexus/**/*]
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - sh nexus/deploy.sh
+
+# One Ubuntu binary per release, each built inside that release's image (see app/Dockerfile.build).
+# To add or drop a release, edit the UBUNTU list (and the release links below).
+# The binary is copied out with `docker cp`: the runner is a container, so bind mounts would not work.
+build-linux:
+  stage: build
+  parallel:
+    matrix:
+      - UBUNTU: ["20.04", "22.04", "24.04"]
+  script:
+    - docker build --build-arg UBUNTU="$UBUNTU" --build-arg VERSION="$CI_COMMIT_SHORT_SHA"
+        -f app/Dockerfile.build -t "hello-build:$UBUNTU" app
+    - mkdir -p dist
+    - docker rm -f "hello-build-$CI_JOB_ID" >/dev/null 2>&1 || true
+    # --network none: only used to copy a file out; Podman 3.4 has no network called "default"
+    - docker create --network none --name "hello-build-$CI_JOB_ID" "hello-build:$UBUNTU"
+    - docker cp "hello-build-$CI_JOB_ID:/out/hello" "dist/hello-ubuntu$UBUNTU"
+    - docker rm "hello-build-$CI_JOB_ID"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        B="$NEXUS_URL/repository/$NEXUS_REPO/hello"
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T "dist/hello-ubuntu$UBUNTU" "$B/$RELEASE_VERSION/hello-ubuntu$UBUNTU"
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T "dist/hello-ubuntu$UBUNTU" "$B/latest/hello-ubuntu$UBUNTU"
+      fi
+  artifacts:
+    paths: [dist/hello-ubuntu*]
+    expire_in: 1 week
+
+# Windows hello.exe, built on the same Podman runner: PyInstaller for Windows under Wine (app/Dockerfile.build-exe).
+# No Windows machine needed. (app/build.bat still builds it natively on Windows by hand.)
+build-exe:
+  stage: build
+  script:
+    - docker build --build-arg VERSION="$CI_COMMIT_SHORT_SHA"
+        -f app/Dockerfile.build-exe -t hello-build:exe app
+    - mkdir -p dist
+    - docker rm -f "hello-build-exe-$CI_JOB_ID" >/dev/null 2>&1 || true
+    - docker create --network none --name "hello-build-exe-$CI_JOB_ID" hello-build:exe
+    - docker cp "hello-build-exe-$CI_JOB_ID:/out/hello.exe" dist/hello.exe
+    - docker rm "hello-build-exe-$CI_JOB_ID"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        B="$NEXUS_URL/repository/$NEXUS_REPO/hello"
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T dist/hello.exe "$B/$RELEASE_VERSION/hello.exe"
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T dist/hello.exe "$B/latest/hello.exe"
+      fi
+  artifacts:
+    paths: [dist/hello.exe]
+    expire_in: 1 week
+
+# Every *.sh in the root of this repo is uploaded to Nexus next to the binaries.
+publish-sh:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      B="$NEXUS_URL/repository/$NEXUS_REPO/hello"
+      for f in *.sh; do
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T "$f" "$B/$RELEASE_VERSION/$f"
+        curl -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -T "$f" "$B/latest/$f"
+        echo "uploaded $f"
+      done
+
+# Every merge to main becomes a numbered GitLab release (Deploy -> Releases) that links the stored files.
+# Uses the job token + API, so no extra tools are needed on the runner (only curl).
+release:
+  stage: release
+  needs: [build-exe, build-linux, publish-sh]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      VERSION="$RELEASE_VERSION"
+      B="$NEXUS_URL/repository/$NEXUS_REPO/hello/$RELEASE_VERSION"
+      curl -fsS -X POST "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases" \
+        -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
+        -d "{\"tag_name\":\"$VERSION\",\"ref\":\"$CI_COMMIT_SHA\",\"name\":\"$VERSION\",
+             \"description\":\"Built from $CI_COMMIT_SHORT_SHA by pipeline $CI_PIPELINE_ID\",
+             \"assets\":{\"links\":[
+               {\"name\":\"hello.exe\",\"url\":\"$B/hello.exe\"},
+               {\"name\":\"hello-ubuntu20.04\",\"url\":\"$B/hello-ubuntu20.04\"},
+               {\"name\":\"hello-ubuntu22.04\",\"url\":\"$B/hello-ubuntu22.04\"},
+               {\"name\":\"hello-ubuntu24.04\",\"url\":\"$B/hello-ubuntu24.04\"},
+               {\"name\":\"hello.sh\",\"url\":\"$B/hello.sh\"}]}}"
+      echo "released $VERSION"

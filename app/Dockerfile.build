@@ -1,0 +1,16 @@
+# Builds the Linux binary inside a given Ubuntu release, so it links against that release's glibc.
+# Usage: docker build --build-arg UBUNTU=22.04 --build-arg VERSION=abc123 -f Dockerfile.build .   (context: sample/)
+ARG UBUNTU=22.04
+FROM ubuntu:${UBUNTU}
+ARG VERSION=local
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-pip libpython3-dev binutils ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY requirements.txt hello.py ./
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --quiet -r requirements.txt \
+ && sed "s/__VERSION__/${VERSION}/" hello.py > build_hello.py \
+ && /venv/bin/pyinstaller --noconfirm --onefile --name hello --distpath /out build_hello.py \
+ && /out/hello
